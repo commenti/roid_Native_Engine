@@ -8,12 +8,10 @@ on:
   workflow_dispatch:
 
 env:
-  NDK_VERSION:    "26.3.11579264"
-  ANDROID_ABI:    "arm64-v8a"
-  ANDROID_API:    "34"
-  BHOOK_VERSION:  "2.0.0"
-  BUILD_DIR:      "${{ github.workspace }}/build_output"
-  ENGINE_DIR:     "${{ github.workspace }}/roid_Native_Engine.git"
+  NDK_VERSION:   "26.3.11579264"
+  ANDROID_ABI:   "arm64-v8a"
+  ANDROID_API:   "34"
+  BHOOK_VERSION: "2.0.0"
 
 jobs:
   build:
@@ -28,19 +26,29 @@ jobs:
         with:
           fetch-depth: 1
 
-      # ── 2. Verify ENGINE_DIR exists immediately after checkout ─────────────
-      - name: Verify project structure
+      # ── 2. Resolve paths from actual repo structure ────────────────────────
+      # ENGINE_DIR = repo root (CMakeLists.txt lives here directly)
+      # BUILD_DIR  = sibling of repo root to guarantee out-of-source clean build
+      - name: Resolve and export paths
         run: |
-          if [[ ! -d "${{ github.workspace }}/roid_Native_Engine.git" ]]; then
-            echo "::error title=Missing Directory::roid_Native_Engine.git not found in repo root."
-            echo "::error::Repo root contents:"
-            ls -la "${{ github.workspace }}"
+          ENGINE_DIR="${GITHUB_WORKSPACE}"
+          BUILD_DIR="${GITHUB_WORKSPACE}/../build_output"
+
+          # Hard assert: CMakeLists.txt must exist at engine root
+          if [[ ! -f "${ENGINE_DIR}/CMakeLists.txt" ]]; then
+            echo "::error title=Bad Repo Structure::CMakeLists.txt not found at ${ENGINE_DIR}"
+            echo "::error::Actual contents:"
+            ls -la "${ENGINE_DIR}"
             exit 1
           fi
-          echo "ENGINE_DIR=${{ github.workspace }}/roid_Native_Engine.git" >> "${GITHUB_ENV}"
-          echo "BUILD_DIR=${{ github.workspace }}/build_output"             >> "${GITHUB_ENV}"
 
-      # ── 3. Java ────────────────────────────────────────────────────────────
+          # Materialise the build dir now so all later steps can rely on it
+          mkdir -p "${BUILD_DIR}"
+
+          echo "ENGINE_DIR=${ENGINE_DIR}" >> "${GITHUB_ENV}"
+          echo "BUILD_DIR=${BUILD_DIR}"   >> "${GITHUB_ENV}"
+
+      # ── 3. Java (required by sdkmanager) ──────────────────────────────────
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -51,18 +59,15 @@ jobs:
       - name: Install build tools
         run: |
           ERROR_LOG="$(mktemp)"
-          sudo apt-get update -q                                         \
-              2>"${ERROR_LOG}" >> /dev/null                              \
-          || {
-              echo "::error title=APT Update Failed::$(cat "${ERROR_LOG}")"
-              exit 1
+          sudo apt-get update -q 2>"${ERROR_LOG}" >> /dev/null || {
+            echo "::error title=APT Update Failed::$(cat "${ERROR_LOG}")"
+            exit 1
           }
-          sudo apt-get install -y --no-install-recommends               \
-              wget unzip curl ninja-build cmake                         \
-              2>"${ERROR_LOG}" >> /dev/null                             \
-          || {
-              echo "::error title=APT Install Failed::$(cat "${ERROR_LOG}")"
-              exit 1
+          sudo apt-get install -y --no-install-recommends \
+              wget unzip curl ninja-build cmake \
+              2>"${ERROR_LOG}" >> /dev/null || {
+            echo "::error title=APT Install Failed::$(cat "${ERROR_LOG}")"
+            exit 1
           }
 
       # ── 5. Android SDK ─────────────────────────────────────────────────────
@@ -73,122 +78,119 @@ jobs:
       - name: Install pinned NDK ${{ env.NDK_VERSION }}
         run: |
           ERROR_LOG="$(mktemp)"
-          sdkmanager --install "ndk;${NDK_VERSION}"                     \
-              --sdk_root="${ANDROID_SDK_ROOT}"                          \
-              2>"${ERROR_LOG}" >> /dev/null                             \
-          || {
-              echo "::error title=NDK Install Failed::$(cat "${ERROR_LOG}")"
-              exit 1
+          sdkmanager --install "ndk;${NDK_VERSION}" \
+              --sdk_root="${ANDROID_SDK_ROOT}" \
+              2>"${ERROR_LOG}" >> /dev/null || {
+            echo "::error title=NDK Install Failed::$(cat "${ERROR_LOG}")"
+            exit 1
           }
           NDK_HOME="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
           if [[ ! -d "${NDK_HOME}" ]]; then
-              echo "::error title=NDK Missing::NDK not found at ${NDK_HOME} after install."
-              exit 1
+            echo "::error title=NDK Missing::NDK not found at ${NDK_HOME} after install."
+            exit 1
           fi
           echo "ANDROID_NDK_HOME=${NDK_HOME}" >> "${GITHUB_ENV}"
 
-      # ── 7. Vendor ByteHook — absolute path, no working-directory ──────────
+      # ── 7. Vendor ByteHook ─────────────────────────────────────────────────
       - name: Vendor ByteHook ${{ env.BHOOK_VERSION }}
         run: |
           ERROR_LOG="$(mktemp)"
-
           SCRIPT="${ENGINE_DIR}/scripts/vendor_bytehook.sh"
 
           if [[ ! -f "${SCRIPT}" ]]; then
-              echo "::error title=Script Missing::vendor_bytehook.sh not found at ${SCRIPT}"
-              exit 1
+            echo "::error title=Script Missing::Not found: ${SCRIPT}"
+            echo "::error::scripts/ contents:"
+            ls -la "${ENGINE_DIR}/scripts/" 2>/dev/null || true
+            exit 1
           fi
 
-          bash "${SCRIPT}" "${BHOOK_VERSION}"                           \
-              2>"${ERROR_LOG}" >> /dev/null                             \
-          || {
-              echo "::error title=ByteHook Vendor Failed::$(cat "${ERROR_LOG}")"
-              exit 1
+          bash "${SCRIPT}" "${BHOOK_VERSION}" \
+              2>"${ERROR_LOG}" >> /dev/null || {
+            echo "::error title=ByteHook Vendor Failed::$(cat "${ERROR_LOG}")"
+            exit 1
           }
 
           HEADER="${ENGINE_DIR}/libs/bytehook/include/bytehook.h"
           SOFILE="${ENGINE_DIR}/libs/bytehook/${ANDROID_ABI}/libbytehook.so"
 
           if [[ ! -f "${HEADER}" ]]; then
-              echo "::error title=ByteHook Header Missing::Not found: ${HEADER}"
-              exit 1
+            echo "::error title=ByteHook Header Missing::Not found: ${HEADER}"
+            exit 1
           fi
           if [[ ! -f "${SOFILE}" ]]; then
-              echo "::error title=ByteHook Library Missing::Not found: ${SOFILE}"
-              exit 1
+            echo "::error title=ByteHook Library Missing::Not found: ${SOFILE}"
+            exit 1
           fi
 
       # ── 8. CMake Configure ─────────────────────────────────────────────────
       - name: CMake Configure
         run: |
           ERROR_LOG="$(mktemp)"
-
           cmake \
-            -S "${ENGINE_DIR}"                                          \
-            -B "${BUILD_DIR}"                                           \
-            -G Ninja                                                    \
+            -S "${ENGINE_DIR}" \
+            -B "${BUILD_DIR}" \
+            -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI="${ANDROID_ABI}"                              \
-            -DANDROID_PLATFORM="android-${ANDROID_API}"                \
-            -DANDROID_STL="c++_static"                                  \
-            -DCMAKE_BUILD_TYPE=Release                                  \
-            -DCMAKE_MAKE_PROGRAM="$(which ninja)"                      \
-            --log-level=ERROR                                           \
-            2>"${ERROR_LOG}" >> /dev/null                              \
-          || {
-              FILTERED="$(grep -E '(CMake Error|FATAL_ERROR|error:)' "${ERROR_LOG}" \
-                          || cat "${ERROR_LOG}")"
-              echo "::error title=CMake Configure Failed::${FILTERED}"
-              exit 1
+            -DANDROID_ABI="${ANDROID_ABI}" \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DANDROID_STL="c++_static" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_MAKE_PROGRAM="$(which ninja)" \
+            --log-level=ERROR \
+            2>"${ERROR_LOG}" >> /dev/null || {
+            FILTERED="$(grep -E '(CMake Error|FATAL_ERROR|error:)' "${ERROR_LOG}" \
+                        || cat "${ERROR_LOG}")"
+            echo "::error title=CMake Configure Failed::${FILTERED}"
+            exit 1
           }
 
       # ── 9. Build ───────────────────────────────────────────────────────────
       - name: CMake Build
         run: |
           FULL_LOG="$(mktemp)"
-
-          cmake --build "${BUILD_DIR}"                                  \
-              --config Release                                          \
-              --parallel "$(nproc)"                                     \
-              > "${FULL_LOG}" 2>&1                                      \
-          || {
-              ERRORS="$(grep -E '(error:|FAILED:|ninja:)' "${FULL_LOG}" | head -50)"
-              if [[ -z "${ERRORS}" ]]; then
-                  ERRORS="$(tail -30 "${FULL_LOG}")"
-              fi
-              echo "::error title=Build Failed::${ERRORS}"
-              while IFS= read -r line; do
-                  [[ -n "${line}" ]] && echo "::error::${line}"
-              done <<< "${ERRORS}"
-              exit 1
+          cmake --build "${BUILD_DIR}" \
+              --config Release \
+              --parallel "$(nproc)" \
+              > "${FULL_LOG}" 2>&1 || {
+            ERRORS="$(grep -E '(error:|FAILED:|ninja:)' "${FULL_LOG}" | head -50)"
+            if [[ -z "${ERRORS}" ]]; then
+              ERRORS="$(tail -30 "${FULL_LOG}")"
+            fi
+            echo "::error title=Build Failed::${ERRORS}"
+            while IFS= read -r line; do
+              [[ -n "${line}" ]] && echo "::error::${line}"
+            done <<< "${ERRORS}"
+            exit 1
           }
 
-      # ── 10. Artifact verification ──────────────────────────────────────────
+      # ── 10. Verify artifacts ───────────────────────────────────────────────
       - name: Verify build artifacts
         run: |
           TOOLCHAIN_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
           if [[ ! -f "${BUILD_DIR}/libobserver.so" ]]; then
-              echo "::error title=Artifact Missing::libobserver.so not found in ${BUILD_DIR}"
-              exit 1
+            echo "::error title=Artifact Missing::libobserver.so not found in ${BUILD_DIR}"
+            ls -la "${BUILD_DIR}" || true
+            exit 1
           fi
           if [[ ! -f "${BUILD_DIR}/libbytehook.so" ]]; then
-              echo "::error title=Artifact Missing::libbytehook.so not staged in ${BUILD_DIR}"
-              exit 1
+            echo "::error title=Artifact Missing::libbytehook.so not staged in ${BUILD_DIR}"
+            ls -la "${BUILD_DIR}" || true
+            exit 1
           fi
 
           FILE_OUT="$(file "${BUILD_DIR}/libobserver.so")"
           if ! echo "${FILE_OUT}" | grep -q "aarch64"; then
-              echo "::error title=Wrong Architecture::Expected aarch64 ELF. Got: ${FILE_OUT}"
-              exit 1
+            echo "::error title=Wrong Architecture::Expected aarch64 ELF. Got: ${FILE_OUT}"
+            exit 1
           fi
 
-          NM_OUT="$("${TOOLCHAIN_BIN}/llvm-nm"                         \
-              --defined-only --extern-only                              \
+          NM_OUT="$("${TOOLCHAIN_BIN}/llvm-nm" \
+              --defined-only --extern-only \
               "${BUILD_DIR}/libobserver.so" 2>&1)"
           if ! echo "${NM_OUT}" | grep -q "JNI_OnLoad"; then
-              echo "::error title=Symbol Missing::JNI_OnLoad not exported from libobserver.so"
-              exit 1
+            echo "::error title=Symbol Missing::JNI_OnLoad not exported from libobserver.so"
+            exit 1
           fi
 
           echo "::notice title=Build Passed::libobserver.so (arm64-v8a) verified successfully."
