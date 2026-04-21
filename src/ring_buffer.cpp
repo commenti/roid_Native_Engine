@@ -1,160 +1,140 @@
 #include "ring_buffer.h"
+
 #include <cstring>
-#include <unistd.h>
-#include <sys/types.h>
-#include <time.h>
+#include <algorithm>
+
+// Android logcat — used only in diagnostics, never in hot path.
 #include <android/log.h>
+#include "config.h"
 
-#define LOG_TAG "Observer::RingBuffer"
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+namespace passive_observer {
 
-namespace observer {
+// ─────────────────────────────────────────────────────────────────────────────
+// SPSCRingBuffer — implementation
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ─────────────────────────────────────────────
-// Static singleton storage - zero heap usage
-// ─────────────────────────────────────────────
-static RingBuffer g_ring_buffer;
-
-RingBuffer& get_ring_buffer() noexcept {
-    return g_ring_buffer;
-}
-
-// ─────────────────────────────────────────────
-// Constructor
-// ─────────────────────────────────────────────
-RingBuffer::RingBuffer()
-    : write_idx_(0),
-      read_idx_(0) {
-    ::memset(buffer_, 0, sizeof(buffer_));
-}
-
-// ─────────────────────────────────────────────
-// Internal: write bytes into circular buffer
-// ─────────────────────────────────────────────
-void RingBuffer::write_bytes(const uint8_t* src, size_t len, size_t start_idx) noexcept {
-    const size_t space_to_end = config::RING_BUFFER_SIZE - (start_idx & config::BUFFER_MASK);
-    if (len <= space_to_end) {
-        ::memcpy(buffer_ + (start_idx & config::BUFFER_MASK), src, len);
-    } else {
-        // Wrap around
-        ::memcpy(buffer_ + (start_idx & config::BUFFER_MASK), src, space_to_end);
-        ::memcpy(buffer_, src + space_to_end, len - space_to_end);
-    }
-}
-
-// ─────────────────────────────────────────────
-// Internal: read bytes from circular buffer
-// ─────────────────────────────────────────────
-void RingBuffer::read_bytes(uint8_t* dst, size_t len, size_t start_idx) const noexcept {
-    const size_t space_to_end = config::RING_BUFFER_SIZE - (start_idx & config::BUFFER_MASK);
-    if (len <= space_to_end) {
-        ::memcpy(dst, buffer_ + (start_idx & config::BUFFER_MASK), len);
-    } else {
-        ::memcpy(dst, buffer_ + (start_idx & config::BUFFER_MASK), space_to_end);
-        ::memcpy(dst + space_to_end, buffer_, len - space_to_end);
-    }
-}
-
-// ─────────────────────────────────────────────
-// push() - Producer side (hook threads)
-// NO malloc, NO I/O, NO blocking
-// ─────────────────────────────────────────────
-bool RingBuffer::push(config::EventType type,
-                      const uint8_t* payload,
-                      uint32_t payload_len) noexcept {
-    // Clamp payload to maximum allowed
-    if (payload_len > config::MAX_PAYLOAD_SIZE) {
-        payload_len = static_cast<uint32_t>(config::MAX_PAYLOAD_SIZE);
+SPSCRingBuffer::SPSCRingBuffer() noexcept {
+    // Zero-initialise all slots explicitly to guarantee a clean state
+    // regardless of BSS initialisation order.
+    for (auto& slot : slots_) {
+        slot.payload_len = 0u;
+        slot.event_type  = EventType::kUnknown;
+        slot.reserved[0] = 0u;
+        slot.reserved[1] = 0u;
+        std::memset(slot.payload, 0, kMaxEventPayloadSize);
     }
 
-    const size_t frame_size = sizeof(config::LogPacket) + payload_len;
+    // Ensure atomic indices start at zero with sequential consistency
+    // so the consumer sees a fully-constructed buffer.
+    head_.store(0u, std::memory_order_seq_cst);
+    tail_.store(0u, std::memory_order_seq_cst);
+    dropped_.store(0u, std::memory_order_seq_cst);
+}
 
-    // Snapshot indices with acquire/relaxed semantics
-    const size_t cur_write = write_idx_.load(std::memory_order_relaxed);
-    const size_t cur_read  = read_idx_.load(std::memory_order_acquire);
+// ─────────────────────────────────────────────────────────────────────────────
+// TryEnqueue  (producer — hook-site context)
+//
+// Memory ordering rationale:
+//   1. Load tail_ with acquire  → synchronises with consumer's release store.
+//   2. Store to slot fields     → plain writes; slot is exclusively ours until
+//                                 we publish head_.
+//   3. Store head_ with release → makes slot data visible to consumer.
+// ─────────────────────────────────────────────────────────────────────────────
+bool SPSCRingBuffer::TryEnqueue(EventType   type,
+                                const void* data,
+                                uint32_t    len) noexcept {
+    const size_t head = head_.load(std::memory_order_relaxed);
+    const size_t tail = tail_.load(std::memory_order_acquire);
 
-    // Check available space (leave 1 frame gap to distinguish full vs empty)
-    const size_t used = cur_write - cur_read;
-    if ((config::RING_BUFFER_SIZE - used) < frame_size) {
-        // Buffer full - drop event, safe in hook context
+    // Full check: one slot is always kept empty as sentinel.
+    if ((head - tail) >= kRingBufferCapacity) {
+        dropped_.fetch_add(1u, std::memory_order_relaxed);
         return false;
     }
 
-    // Build header on stack - zero heap usage
-    config::LogPacket hdr{};
+    RingSlot& slot = slots_[Mask(head)];
 
-    // Timestamp via clock_gettime (async-signal-safe)
-    struct timespec ts{};
-    ::clock_gettime(CLOCK_REALTIME, &ts);
-    hdr.timestamp_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL
-                       + static_cast<uint64_t>(ts.tv_nsec);
+    // Clamp payload to maximum safe size — never overflow the fixed array.
+    const uint32_t copy_len =
+        std::min(len, static_cast<uint32_t>(kMaxEventPayloadSize));
 
-    hdr.type     = type;
-    hdr.pid      = static_cast<uint32_t>(::getpid());
-    hdr.tid      = static_cast<uint32_t>(::gettid());
-    hdr.data_len = payload_len;
+    slot.event_type  = type;
+    slot.payload_len = copy_len;
+    slot.reserved[0] = 0u;
+    slot.reserved[1] = 0u;
 
-    // Write header then payload contiguously
-    write_bytes(reinterpret_cast<const uint8_t*>(&hdr),
-                sizeof(config::LogPacket),
-                cur_write);
+    if (data != nullptr && copy_len > 0u) {
+        std::memcpy(slot.payload, data, copy_len);
+    }
 
-    write_bytes(payload,
-                payload_len,
-                cur_write + sizeof(config::LogPacket));
-
-    // Publish: release so consumer sees completed writes
-    write_idx_.store(cur_write + frame_size, std::memory_order_release);
-
+    // Publish the slot — release store pairs with consumer's acquire load.
+    head_.store(head + 1u, std::memory_order_release);
     return true;
 }
 
-// ─────────────────────────────────────────────
-// pop() - Consumer side (dispatcher thread)
-// ─────────────────────────────────────────────
-size_t RingBuffer::pop(uint8_t* out_buf, size_t out_buf_len) noexcept {
-    const size_t cur_read  = read_idx_.load(std::memory_order_relaxed);
-    const size_t cur_write = write_idx_.load(std::memory_order_acquire);
+// ─────────────────────────────────────────────────────────────────────────────
+// TryDequeue  (consumer — dispatcher thread)
+//
+// Memory ordering rationale:
+//   1. Load head_ with acquire  → synchronises with producer's release store.
+//   2. Read slot fields         → safe; producer won't touch this slot until
+//                                 we advance tail_.
+//   3. Store tail_ with release → allows producer to reclaim the slot.
+// ─────────────────────────────────────────────────────────────────────────────
+bool SPSCRingBuffer::TryDequeue(RingSlot& out_slot) noexcept {
+    const size_t tail = tail_.load(std::memory_order_relaxed);
+    const size_t head = head_.load(std::memory_order_acquire);
 
-    if (cur_read == cur_write) {
-        // Buffer empty
-        return 0;
+    if (tail == head) {
+        // Buffer is empty.
+        return false;
     }
 
-    // Read header first to learn frame size
-    if (out_buf_len < sizeof(config::LogPacket)) {
-        return 0;
+    const RingSlot& slot = slots_[Mask(tail)];
+
+    // Copy the entire slot to caller-supplied storage.
+    out_slot.event_type  = slot.event_type;
+    out_slot.payload_len = slot.payload_len;
+    out_slot.reserved[0] = slot.reserved[0];
+    out_slot.reserved[1] = slot.reserved[1];
+
+    if (slot.payload_len > 0u) {
+        std::memcpy(out_slot.payload, slot.payload, slot.payload_len);
     }
 
-    config::LogPacket hdr{};
-    read_bytes(reinterpret_cast<uint8_t*>(&hdr),
-               sizeof(config::LogPacket),
-               cur_read);
-
-    const size_t frame_size = sizeof(config::LogPacket) + hdr.data_len;
-
-    // Validate frame is fully written and fits output buffer
-    const size_t available = cur_write - cur_read;
-    if (available < frame_size || out_buf_len < frame_size) {
-        return 0;
-    }
-
-    // Copy full frame (header + payload) into output buffer
-    read_bytes(out_buf, frame_size, cur_read);
-
-    // Advance read index - release so producer sees freed space
-    read_idx_.store(cur_read + frame_size, std::memory_order_release);
-
-    return frame_size;
+    // Release the slot back to the producer.
+    tail_.store(tail + 1u, std::memory_order_release);
+    return true;
 }
 
-// ─────────────────────────────────────────────
-// available_read() - consumer-side hint only
-// ─────────────────────────────────────────────
-size_t RingBuffer::available_read() const noexcept {
-    const size_t w = write_idx_.load(std::memory_order_acquire);
-    const size_t r = read_idx_.load(std::memory_order_relaxed);
-    return w - r;
+// ─────────────────────────────────────────────────────────────────────────────
+// Diagnostics
+// ─────────────────────────────────────────────────────────────────────────────
+size_t SPSCRingBuffer::ApproxSize() const noexcept {
+    const size_t head = head_.load(std::memory_order_relaxed);
+    const size_t tail = tail_.load(std::memory_order_relaxed);
+    return (head >= tail) ? (head - tail) : 0u;
 }
 
-} // namespace observer
+bool SPSCRingBuffer::IsEmpty() const noexcept {
+    return head_.load(std::memory_order_relaxed) ==
+           tail_.load(std::memory_order_relaxed);
+}
+
+uint64_t SPSCRingBuffer::DroppedCount() const noexcept {
+    return dropped_.load(std::memory_order_relaxed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Global singleton
+//
+// Constructed once during .init_array (before JNI_OnLoad).
+// The object lives for the entire process lifetime — no destructor races.
+// ─────────────────────────────────────────────────────────────────────────────
+static SPSCRingBuffer g_ring_buffer;
+
+SPSCRingBuffer& GetRingBuffer() noexcept {
+    return g_ring_buffer;
+}
+
+} // namespace passive_observer
