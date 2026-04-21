@@ -11,7 +11,7 @@ env:
   NDK_VERSION:   "26.3.11579264"
   ANDROID_ABI:   "arm64-v8a"
   ANDROID_API:   "34"
-  BHOOK_VERSION: "2.0.0"
+  BHOOK_TAG:     "v2.0.0"
 
 jobs:
   build:
@@ -27,28 +27,22 @@ jobs:
           fetch-depth: 1
 
       # ── 2. Resolve paths from actual repo structure ────────────────────────
-      # ENGINE_DIR = repo root (CMakeLists.txt lives here directly)
-      # BUILD_DIR  = sibling of repo root to guarantee out-of-source clean build
       - name: Resolve and export paths
         run: |
           ENGINE_DIR="${GITHUB_WORKSPACE}"
           BUILD_DIR="${GITHUB_WORKSPACE}/../build_output"
 
-          # Hard assert: CMakeLists.txt must exist at engine root
           if [[ ! -f "${ENGINE_DIR}/CMakeLists.txt" ]]; then
             echo "::error title=Bad Repo Structure::CMakeLists.txt not found at ${ENGINE_DIR}"
-            echo "::error::Actual contents:"
             ls -la "${ENGINE_DIR}"
             exit 1
           fi
 
-          # Materialise the build dir now so all later steps can rely on it
           mkdir -p "${BUILD_DIR}"
-
           echo "ENGINE_DIR=${ENGINE_DIR}" >> "${GITHUB_ENV}"
           echo "BUILD_DIR=${BUILD_DIR}"   >> "${GITHUB_ENV}"
 
-      # ── 3. Java (required by sdkmanager) ──────────────────────────────────
+      # ── 3. Java ────────────────────────────────────────────────────────────
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -64,7 +58,7 @@ jobs:
             exit 1
           }
           sudo apt-get install -y --no-install-recommends \
-              wget unzip curl ninja-build cmake \
+              git wget unzip curl ninja-build cmake \
               2>"${ERROR_LOG}" >> /dev/null || {
             echo "::error title=APT Install Failed::$(cat "${ERROR_LOG}")"
             exit 1
@@ -91,21 +85,21 @@ jobs:
           fi
           echo "ANDROID_NDK_HOME=${NDK_HOME}" >> "${GITHUB_ENV}"
 
-      # ── 7. Vendor ByteHook ─────────────────────────────────────────────────
-      - name: Vendor ByteHook ${{ env.BHOOK_VERSION }}
+      # ── 7. Vendor ByteHook via git clone (no curl/zip guessing) ───────────
+      - name: Vendor ByteHook ${{ env.BHOOK_TAG }}
         run: |
           ERROR_LOG="$(mktemp)"
           SCRIPT="${ENGINE_DIR}/scripts/vendor_bytehook.sh"
 
           if [[ ! -f "${SCRIPT}" ]]; then
             echo "::error title=Script Missing::Not found: ${SCRIPT}"
-            echo "::error::scripts/ contents:"
             ls -la "${ENGINE_DIR}/scripts/" 2>/dev/null || true
             exit 1
           fi
 
-          bash "${SCRIPT}" "${BHOOK_VERSION}" \
-              2>"${ERROR_LOG}" >> /dev/null || {
+          chmod +x "${SCRIPT}"
+          bash "${SCRIPT}" "${BHOOK_TAG}" \
+              2>"${ERROR_LOG}" || {
             echo "::error title=ByteHook Vendor Failed::$(cat "${ERROR_LOG}")"
             exit 1
           }
@@ -115,10 +109,13 @@ jobs:
 
           if [[ ! -f "${HEADER}" ]]; then
             echo "::error title=ByteHook Header Missing::Not found: ${HEADER}"
+            # Dump what was actually vendored to help diagnose
+            find "${ENGINE_DIR}/libs/bytehook" -type f 2>/dev/null || true
             exit 1
           fi
           if [[ ! -f "${SOFILE}" ]]; then
             echo "::error title=ByteHook Library Missing::Not found: ${SOFILE}"
+            find "${ENGINE_DIR}/libs/bytehook" -type f 2>/dev/null || true
             exit 1
           fi
 
