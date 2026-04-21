@@ -13,7 +13,7 @@ env:
   ANDROID_API:    "34"
   BHOOK_VERSION:  "2.0.0"
   BUILD_DIR:      "${{ github.workspace }}/build_output"
-  ENGINE_DIR:     "${{ github.workspace }}/1_Android_Native_Engine"
+  ENGINE_DIR:     "${{ github.workspace }}/roid_Native_Engine.git"
 
 jobs:
   build:
@@ -31,13 +31,13 @@ jobs:
       # ── 2. Verify ENGINE_DIR exists immediately after checkout ─────────────
       - name: Verify project structure
         run: |
-          if [[ ! -d "${{ github.workspace }}/1_Android_Native_Engine" ]]; then
-            echo "::error title=Missing Directory::1_Android_Native_Engine not found in repo root."
+          if [[ ! -d "${{ github.workspace }}/roid_Native_Engine.git" ]]; then
+            echo "::error title=Missing Directory::roid_Native_Engine.git not found in repo root."
             echo "::error::Repo root contents:"
             ls -la "${{ github.workspace }}"
             exit 1
           fi
-          echo "ENGINE_DIR=${{ github.workspace }}/1_Android_Native_Engine" >> "${GITHUB_ENV}"
+          echo "ENGINE_DIR=${{ github.workspace }}/roid_Native_Engine.git" >> "${GITHUB_ENV}"
           echo "BUILD_DIR=${{ github.workspace }}/build_output"             >> "${GITHUB_ENV}"
 
       # ── 3. Java ────────────────────────────────────────────────────────────
