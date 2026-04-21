@@ -1,60 +1,62 @@
 #!/usr/bin/env bash
-# Vendors ByteHook headers + arm64-v8a prebuilt into libs/bytehook/
-# Usage: bash scripts/vendor_bytehook.sh [BHOOK_VERSION]
-# Requires: curl, unzip, sha256sum
+# Vendors ByteHook by cloning the official repo and copying
+# the prebuilt headers + AAR-extracted .so into libs/bytehook/
+# Usage: bash scripts/vendor_bytehook.sh [TAG]
+# TAG defaults to the latest stable release tag.
 
 set -euo pipefail
 
-BHOOK_VERSION="${1:-2.0.0}"
-REPO="bytedance/bhook"
-RELEASE_URL="https://github.com/${REPO}/releases/download/${BHOOK_VERSION}"
-ARCHIVE="bhook-${BHOOK_VERSION}-android.zip"
-CHECKSUM_FILE="scripts/bytehook_checksums.sha256"
-
-VENDOR_ROOT="$(cd "$(dirname "$0")/.." && pwd)/libs/bytehook"
+BHOOK_TAG="${1:-v2.0.0}"
+REPO_URL="https://github.com/bytedance/bhook.git"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+VENDOR_DIR="${ROOT_DIR}/libs/bytehook"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
-echo "[vendor] ByteHook version : ${BHOOK_VERSION}"
-echo "[vendor] Download URL     : ${RELEASE_URL}/${ARCHIVE}"
-echo "[vendor] Vendor target    : ${VENDOR_ROOT}"
+echo "[vendor] Cloning bhook tag=${BHOOK_TAG}"
+git clone --depth 1 --branch "${BHOOK_TAG}" \
+    "${REPO_URL}" "${TMP_DIR}/bhook" \
+    2>&1 | grep -E '(Cloning|error|fatal)' || true
 
-# ── Download ──────────────────────────────────────────────────────────────────
-curl -fsSL --retry 3 \
-    "${RELEASE_URL}/${ARCHIVE}" \
-    -o "${TMP_DIR}/${ARCHIVE}"
+CLONE_DIR="${TMP_DIR}/bhook"
 
-# ── Checksum verification (optional but recommended) ──────────────────────────
-if [[ -f "${CHECKSUM_FILE}" ]]; then
-    echo "[vendor] Verifying checksum..."
-    (cd "${TMP_DIR}" && sha256sum --check --ignore-missing \
-        "$(cd "$(dirname "$0")/.." && pwd)/${CHECKSUM_FILE}")
-else
-    echo "[vendor] WARNING: No checksum file at ${CHECKSUM_FILE}. Skipping verification."
-fi
-
-# ── Unpack ────────────────────────────────────────────────────────────────────
-unzip -q "${TMP_DIR}/${ARCHIVE}" -d "${TMP_DIR}/unpacked"
-
-# ── Install headers ───────────────────────────────────────────────────────────
-mkdir -p "${VENDOR_ROOT}/include"
-find "${TMP_DIR}/unpacked" -name "bytehook.h" -exec \
-    cp -v {} "${VENDOR_ROOT}/include/bytehook.h" \;
-
-# ── Install prebuilt .so for each ABI present in the archive ─────────────────
-for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
-    SO_SRC=$(find "${TMP_DIR}/unpacked" -path "*/${ABI}/libbytehook.so" | head -n1)
-    if [[ -n "${SO_SRC}" ]]; then
-        mkdir -p "${VENDOR_ROOT}/${ABI}"
-        cp -v "${SO_SRC}" "${VENDOR_ROOT}/${ABI}/libbytehook.so"
-        echo "[vendor] Installed ${ABI}/libbytehook.so"
-    fi
-done
-
-# ── Sanity check ─────────────────────────────────────────────────────────────
-if [[ ! -f "${VENDOR_ROOT}/include/bytehook.h" ]]; then
-    echo "[vendor] FATAL: bytehook.h was not found in the archive. Check release structure."
+if [[ ! -d "${CLONE_DIR}" ]]; then
+    echo "[vendor] FATAL: clone failed — ${CLONE_DIR} not found"
     exit 1
 fi
 
-echo "[vendor] Done. Verify with: ls -lR ${VENDOR_ROOT}"
+# ── Install headers ───────────────────────────────────────────────────────────
+# Header lives at: bytehook/include/bytehook.h inside the repo
+HEADER_SRC="${CLONE_DIR}/bytehook/include/bytehook.h"
+if [[ ! -f "${HEADER_SRC}" ]]; then
+    echo "[vendor] FATAL: bytehook.h not found at expected path: ${HEADER_SRC}"
+    echo "[vendor] Repo tree (3 levels):"
+    find "${CLONE_DIR}" -maxdepth 3 -name "*.h" || true
+    exit 1
+fi
+
+mkdir -p "${VENDOR_DIR}/include"
+cp -v "${HEADER_SRC}" "${VENDOR_DIR}/include/bytehook.h"
+
+# ── Install prebuilt .so from the repo's prebuilt/ directory ─────────────────
+# bhook ships prebuilts at: bytehook/src/main/cpp/libs/<ABI>/libbytehook.so
+for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+    SO_SRC=$(find "${CLONE_DIR}" \
+        -path "*/${ABI}/libbytehook.so" | head -n1)
+    if [[ -n "${SO_SRC}" ]]; then
+        mkdir -p "${VENDOR_DIR}/${ABI}"
+        cp -v "${SO_SRC}" "${VENDOR_DIR}/${ABI}/libbytehook.so"
+        echo "[vendor] Installed ${ABI}/libbytehook.so"
+    else
+        echo "[vendor] WARNING: libbytehook.so not found for ABI=${ABI} — skipping."
+    fi
+done
+
+# ── Final assertion ───────────────────────────────────────────────────────────
+if [[ ! -f "${VENDOR_DIR}/include/bytehook.h" ]]; then
+    echo "[vendor] FATAL: Header copy failed."
+    exit 1
+fi
+
+echo "[vendor] Done: $(ls -lh "${VENDOR_DIR}/include/bytehook.h")"
