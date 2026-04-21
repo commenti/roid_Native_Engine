@@ -6,12 +6,18 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      bhook_version:
+        description: "ByteHook Maven version (e.g. 2.0.0) or 'latest'"
+        required: false
+        default: "2.0.0"
 
 env:
-  NDK_VERSION: "26.3.11579264"
-  ANDROID_ABI: "arm64-v8a"
-  ANDROID_API: "34"
-  BHOOK_REF: ""
+  NDK_VERSION:    "26.3.11579264"
+  ANDROID_ABI:    "arm64-v8a"
+  ANDROID_API:    "34"
+  # Use workflow_dispatch input if provided, else default to 2.0.0
+  BHOOK_VERSION:  ${{ github.event.inputs.bhook_version || '2.0.0' }}
 
 jobs:
   build:
@@ -20,11 +26,13 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
+      # ── 2. Resolve paths ───────────────────────────────────────────────────
       - name: Resolve and export paths
         shell: bash
         run: |
@@ -40,44 +48,57 @@ jobs:
 
           mkdir -p "${BUILD_DIR}"
           echo "ENGINE_DIR=${ENGINE_DIR}" >> "${GITHUB_ENV}"
-          echo "BUILD_DIR=${BUILD_DIR}" >> "${GITHUB_ENV}"
+          echo "BUILD_DIR=${BUILD_DIR}"   >> "${GITHUB_ENV}"
 
+      # ── 3. Java ────────────────────────────────────────────────────────────
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
+      # ── 4. System dependencies ─────────────────────────────────────────────
       - name: Install build tools
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -q
+          ERROR_LOG="$(mktemp)"
+          sudo apt-get update -q 2>"${ERROR_LOG}" >/dev/null || {
+            echo "::error title=APT Update Failed::$(cat "${ERROR_LOG}")"
+            exit 1
+          }
           sudo apt-get install -y --no-install-recommends \
-            git wget unzip curl ninja-build cmake
+              curl unzip ninja-build cmake \
+              2>"${ERROR_LOG}" >/dev/null || {
+            echo "::error title=APT Install Failed::$(cat "${ERROR_LOG}")"
+            exit 1
+          }
 
+      # ── 5. Android SDK ─────────────────────────────────────────────────────
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      # ── 6. NDK — pinned version ────────────────────────────────────────────
       - name: Install pinned NDK ${{ env.NDK_VERSION }}
         shell: bash
         run: |
           set -euo pipefail
-          sdkmanager --install "ndk;${NDK_VERSION}" --sdk_root="${ANDROID_SDK_ROOT}"
+          sdkmanager --install "ndk;${NDK_VERSION}" \
+              --sdk_root="${ANDROID_SDK_ROOT}" >/dev/null
           NDK_HOME="${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}"
-
           if [[ ! -d "${NDK_HOME}" ]]; then
             echo "::error title=NDK Missing::NDK not found at ${NDK_HOME} after install."
             exit 1
           fi
-
           echo "ANDROID_NDK_HOME=${NDK_HOME}" >> "${GITHUB_ENV}"
 
-      - name: Vendor ByteHook
+      # ── 7. Vendor ByteHook from Maven Central AAR ──────────────────────────
+      # The AAR is the only authoritative source of prebuilt libbytehook.so.
+      # Git clone of bytedance/bhook contains source only — no prebuilt .so.
+      - name: Vendor ByteHook ${{ env.BHOOK_VERSION }} from Maven Central
         shell: bash
         run: |
           set -euo pipefail
-          ERROR_LOG="$(mktemp)"
           SCRIPT="${ENGINE_DIR}/scripts/vendor_bytehook.sh"
 
           if [[ ! -f "${SCRIPT}" ]]; then
@@ -88,33 +109,38 @@ jobs:
 
           chmod +x "${SCRIPT}"
 
-          if [[ -n "${BHOOK_REF}" ]]; then
-            bash "${SCRIPT}" "${BHOOK_REF}" 2>"${ERROR_LOG}" || {
-              echo "::error title=ByteHook Vendor Failed::$(cat "${ERROR_LOG}")"
-              exit 1
-            }
-          else
-            bash "${SCRIPT}" 2>"${ERROR_LOG}" || {
-              echo "::error title=ByteHook Vendor Failed::$(cat "${ERROR_LOG}")"
-              exit 1
-            }
-          fi
+          FULL_LOG="$(mktemp)"
+          bash "${SCRIPT}" "${BHOOK_VERSION}" >"${FULL_LOG}" 2>&1 || {
+            echo "::error title=ByteHook Vendor Failed::$(tail -30 "${FULL_LOG}")"
+            exit 1
+          }
 
+          # Hard assertions — fail with exact missing path
           HEADER="${ENGINE_DIR}/libs/bytehook/include/bytehook.h"
           SOFILE="${ENGINE_DIR}/libs/bytehook/${ANDROID_ABI}/libbytehook.so"
 
           if [[ ! -f "${HEADER}" ]]; then
             echo "::error title=ByteHook Header Missing::Not found: ${HEADER}"
-            find "${ENGINE_DIR}/libs/bytehook" -type f 2>/dev/null || true
+            find "${ENGINE_DIR}/libs/bytehook" -type f 2>/dev/null | sed 's#^#  #' || true
             exit 1
           fi
 
           if [[ ! -f "${SOFILE}" ]]; then
             echo "::error title=ByteHook Library Missing::Not found: ${SOFILE}"
-            find "${ENGINE_DIR}/libs/bytehook" -type f 2>/dev/null || true
+            find "${ENGINE_DIR}/libs/bytehook" -type f 2>/dev/null | sed 's#^#  #' || true
             exit 1
           fi
 
+          # Confirm the .so is a valid ELF before handing it to CMake
+          file "${SOFILE}" | grep -q "ELF" || {
+            echo "::error title=ByteHook Library Corrupt::${SOFILE} is not a valid ELF."
+            file "${SOFILE}"
+            exit 1
+          }
+
+          echo "::notice title=ByteHook Vendored::${SOFILE} ($(du -sh "${SOFILE}" | cut -f1))"
+
+      # ── 8. CMake Configure ─────────────────────────────────────────────────
       - name: CMake Configure
         shell: bash
         run: |
@@ -128,17 +154,19 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI="${ANDROID_ABI}" \
             -DANDROID_PLATFORM="android-${ANDROID_API}" \
-            -DANDROID_STL="c++_shared" \
+            -DANDROID_STL="c++_static" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_MAKE_PROGRAM="$(command -v ninja)" \
             -DCMAKE_SUPPRESS_REGENERATION=ON \
             --log-level=ERROR \
             2>"${ERROR_LOG}" >/dev/null || {
-              FILTERED="$(grep -E '(CMake Error|FATAL_ERROR|error:)' "${ERROR_LOG}" || cat "${ERROR_LOG}")"
-              echo "::error title=CMake Configure Failed::${FILTERED}"
-              exit 1
-            }
+            FILTERED="$(grep -E '(CMake Error|FATAL_ERROR|error:)' "${ERROR_LOG}" \
+                        || cat "${ERROR_LOG}")"
+            echo "::error title=CMake Configure Failed::${FILTERED}"
+            exit 1
+          }
 
+      # ── 9. Build ───────────────────────────────────────────────────────────
       - name: CMake Build
         shell: bash
         run: |
@@ -146,17 +174,21 @@ jobs:
           FULL_LOG="$(mktemp)"
 
           cmake --build "${BUILD_DIR}" \
-            --config Release \
-            --parallel 1 \
-            > "${FULL_LOG}" 2>&1 || {
-              ERRORS="$(grep -E '(error:|FAILED:|ninja:|gmake\[|make\[)' "${FULL_LOG}" | head -50)"
-              if [[ -z "${ERRORS}" ]]; then
-                ERRORS="$(tail -50 "${FULL_LOG}")"
-              fi
-              echo "::error title=Build Failed::${ERRORS}"
-              exit 1
-            }
+              --config Release \
+              --parallel "$(nproc)" \
+              >"${FULL_LOG}" 2>&1 || {
+            ERRORS="$(grep -E '(error:|FAILED:|ninja:)' "${FULL_LOG}" | head -50)"
+            if [[ -z "${ERRORS}" ]]; then
+              ERRORS="$(tail -50 "${FULL_LOG}")"
+            fi
+            echo "::error title=Build Failed::${ERRORS}"
+            while IFS= read -r line; do
+              [[ -n "${line}" ]] && echo "::error::${line}"
+            done <<< "${ERRORS}"
+            exit 1
+          }
 
+      # ── 10. Verify artifacts ───────────────────────────────────────────────
       - name: Verify build artifacts
         shell: bash
         run: |
@@ -175,10 +207,22 @@ jobs:
             exit 1
           fi
 
-          "${TOOLCHAIN_BIN}/llvm-readelf" -h "${BUILD_DIR}/libobserver.so" >/dev/null
+          "${TOOLCHAIN_BIN}/llvm-readelf" -h "${BUILD_DIR}/libobserver.so" >/dev/null || {
+            echo "::error title=ELF Corrupt::llvm-readelf rejected libobserver.so"
+            exit 1
+          }
+
+          NM_OUT="$("${TOOLCHAIN_BIN}/llvm-nm" \
+              --defined-only --extern-only \
+              "${BUILD_DIR}/libobserver.so" 2>&1)"
+          if ! echo "${NM_OUT}" | grep -q "JNI_OnLoad"; then
+            echo "::error title=Symbol Missing::JNI_OnLoad not exported from libobserver.so"
+            exit 1
+          fi
 
           echo "::notice title=Build Passed::libobserver.so (arm64-v8a) verified successfully."
 
+      # ── 11. Upload artifacts ───────────────────────────────────────────────
       - name: Upload libobserver.so
         uses: actions/upload-artifact@v4
         with:
