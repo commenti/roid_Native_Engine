@@ -1,39 +1,24 @@
-#ifndef OBSERVER_CONFIG_H
-#define OBSERVER_CONFIG_H
+#pragma once
 
+#include <android/log.h>
 #include <cstdint>
-#include <cstddef>
 
 namespace observer::config {
-    // Termux TCP Server details
-    inline constexpr const char* SERVER_IP = "127.0.0.1";
-    inline constexpr uint16_t SERVER_PORT = 8888;
+    // Lock-Free SPSC Ring Buffer Configuration
+    // Pre-allocated in .bss/data section to guarantee zero-malloc during hooks
+    constexpr uint32_t RB_PAYLOAD_MAX = 256;
+    constexpr uint32_t RB_CAPACITY    = 1024;
+    constexpr uint32_t RB_TOTAL_SIZE  = RB_PAYLOAD_MAX * RB_CAPACITY;
 
-    // SPSC Ring Buffer Size (Must be power of 2 for bitmask indexing)
-    inline constexpr size_t RING_BUFFER_SIZE = 2097152; // 2MB
-    inline constexpr size_t BUFFER_MASK = RING_BUFFER_SIZE - 1;
+    // Async Dispatcher TCP Configuration
+    constexpr const char* SERVER_HOST = "127.0.0.1";
+    constexpr uint16_t    SERVER_PORT = 41956;
+    constexpr int         TCP_TIMEOUT_MS = 50;
 
-    // Data limits
-    inline constexpr size_t MAX_PAYLOAD_SIZE = 8192;
-
-    enum class EventType : uint8_t {
-        NET_CONNECT = 1,
-        NET_SEND    = 2,
-        NET_RECV    = 3,
-        SSL_WRITE   = 4,
-        SSL_READ    = 5
-    };
-
-    #pragma pack(push, 1)
-    struct LogPacket {
-        uint64_t timestamp_ns;
-        EventType type;
-        uint32_t pid;
-        uint32_t tid;
-        uint32_t data_len;
-        // Followed by raw data_len bytes
-    };
-    #pragma pack(pop)
+    // Diagnostic
+    constexpr const char* LOG_TAG = "PassiveObserver";
 }
 
-#endif // OBSERVER_CONFIG_H
+// Strict stack-only logging macro. Bypasses std::string/iostream to prevent heap allocation.
+#define OBS_LOG(prio, fmt, ...) \
+    __android_log_print(prio, observer::config::LOG_TAG, fmt, ##__VA_ARGS__)
